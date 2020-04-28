@@ -10,12 +10,12 @@ use criterion::{
 };
 use std::{borrow::Cow, clone::Clone, fmt::Debug, net::IpAddr};
 use wirefilter::{
-    ExecutionContext, FilterAst, Function, FunctionArgKind, FunctionArgs, FunctionImpl,
-    FunctionParam, GetType, LhsValue, Scheme, Type,
+    ExecutionContext, FilterAst, FunctionArgKind, FunctionArgs, GetType, LhsValue, Scheme,
+    SimpleFunctionDefinition, SimpleFunctionImpl, SimpleFunctionParam, Type,
 };
 
-fn lowercase<'a>(args: FunctionArgs<'_, 'a>) -> LhsValue<'a> {
-    let input = args.next().unwrap();
+fn lowercase<'a>(args: FunctionArgs<'_, 'a>) -> Option<LhsValue<'a>> {
+    let input = args.next()?.ok()?;
     match input {
         LhsValue::Bytes(mut bytes) => {
             let make_lowercase = match bytes {
@@ -25,14 +25,14 @@ fn lowercase<'a>(args: FunctionArgs<'_, 'a>) -> LhsValue<'a> {
             if make_lowercase {
                 bytes.to_mut().make_ascii_lowercase();
             }
-            LhsValue::Bytes(bytes)
+            Some(LhsValue::Bytes(bytes))
         }
         _ => panic!("Invalid type: expected Bytes, got {:?}", input),
     }
 }
 
-fn uppercase<'a>(args: FunctionArgs<'_, 'a>) -> LhsValue<'a> {
-    let input = args.next().unwrap();
+fn uppercase<'a>(args: FunctionArgs<'_, 'a>) -> Option<LhsValue<'a>> {
+    let input = args.next()?.ok()?;
     match input {
         LhsValue::Bytes(mut bytes) => {
             let make_uppercase = match bytes {
@@ -42,7 +42,7 @@ fn uppercase<'a>(args: FunctionArgs<'_, 'a>) -> LhsValue<'a> {
             if make_uppercase {
                 bytes.to_mut().make_ascii_uppercase();
             }
-            LhsValue::Bytes(bytes)
+            Some(LhsValue::Bytes(bytes))
         }
         _ => panic!("Invalid type: expected Bytes, got {:?}", input),
     }
@@ -50,7 +50,7 @@ fn uppercase<'a>(args: FunctionArgs<'_, 'a>) -> LhsValue<'a> {
 
 struct FieldBench<'a, T: 'static> {
     field: &'static str,
-    functions: &'a [(&'static str, Function)],
+    functions: &'a [(&'static str, SimpleFunctionDefinition)],
     filters: &'static [&'static str],
     values: &'a [T],
 }
@@ -82,7 +82,7 @@ impl<'a, T: 'static + Copy + Debug + Into<LhsValue<'static>>> FieldBench<'a, T> 
                 "parsing",
                 Benchmark::new(name, {
                     let mut scheme = Scheme::default();
-                    scheme.add_field(field.to_owned(), ty).unwrap();
+                    scheme.add_field(field.to_owned(), ty.clone()).unwrap();
                     for (name, function) in functions {
                         scheme
                             .add_function((*name).into(), function.clone())
@@ -98,7 +98,7 @@ impl<'a, T: 'static + Copy + Debug + Into<LhsValue<'static>>> FieldBench<'a, T> 
                 "compilation",
                 Benchmark::new(name, {
                     let mut scheme = Scheme::default();
-                    scheme.add_field(field.to_owned(), ty).unwrap();
+                    scheme.add_field(field.to_owned(), ty.clone()).unwrap();
                     for (name, function) in functions {
                         scheme
                             .add_function((*name).into(), function.clone())
@@ -118,7 +118,7 @@ impl<'a, T: 'static + Copy + Debug + Into<LhsValue<'static>>> FieldBench<'a, T> 
                     name,
                     {
                         let mut scheme = Scheme::default();
-                        scheme.add_field(field.to_owned(), ty).unwrap();
+                        scheme.add_field(field.to_owned(), ty.clone()).unwrap();
                         for (name, function) in functions {
                             scheme
                                 .add_function((*name).into(), function.clone())
@@ -130,7 +130,9 @@ impl<'a, T: 'static + Copy + Debug + Into<LhsValue<'static>>> FieldBench<'a, T> 
                             let filter = filter.compile();
 
                             let mut exec_ctx = ExecutionContext::new(&scheme);
-                            exec_ctx.set_field_value(field, *value).unwrap();
+                            exec_ctx
+                                .set_field_value(scheme.get_field(field).unwrap(), *value)
+                                .unwrap();
 
                             b.iter(|| filter.execute(&exec_ctx));
                         }
@@ -210,26 +212,26 @@ fn bench_string_function_comparison(c: &mut Criterion) {
         functions: &[
             (
                 "lowercase",
-                Function {
-                    params: vec![FunctionParam {
+                SimpleFunctionDefinition {
+                    params: vec![SimpleFunctionParam {
                         arg_kind: FunctionArgKind::Field,
                         val_type: Type::Bytes,
                     }],
                     opt_params: vec![],
                     return_type: Type::Bytes,
-                    implementation: FunctionImpl::new(lowercase),
+                    implementation: SimpleFunctionImpl::new(lowercase),
                 },
             ),
             (
                 "uppercase",
-                Function {
-                    params: vec![FunctionParam {
+                SimpleFunctionDefinition {
+                    params: vec![SimpleFunctionParam {
                         arg_kind: FunctionArgKind::Field,
                         val_type: Type::Bytes,
                     }],
                     opt_params: vec![],
                     return_type: Type::Bytes,
-                    implementation: FunctionImpl::new(uppercase),
+                    implementation: SimpleFunctionImpl::new(uppercase),
                 },
             ),
         ],

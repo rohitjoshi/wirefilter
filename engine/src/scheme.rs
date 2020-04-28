@@ -1,8 +1,8 @@
 use crate::{
     ast::FilterAst,
-    functions::Function,
-    lex::{complete, expect, span, take_while, LexErrorKind, LexResult, LexWith},
-    types::{GetType, Type},
+    functions::FunctionDefinition,
+    lex::{complete, expect, span, take_while, Lex, LexErrorKind, LexResult, LexWith},
+    types::{GetType, RhsValue, Type},
 };
 use failure::Fail;
 use fnv::FnvBuildHasher;
@@ -10,13 +10,84 @@ use indexmap::map::{Entry, IndexMap};
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
     cmp::{max, min},
+    convert::TryFrom,
     error::Error,
     fmt::{self, Debug, Display, Formatter},
+    iter::Iterator,
     ptr,
 };
 
+/// An error that occurs if two underlying [schemes](struct@Scheme)
+/// don't match.
+#[derive(Debug, PartialEq, Fail)]
+#[fail(display = "underlying schemes do not match")]
+pub struct SchemeMismatchError;
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize)]
+#[serde(tag = "kind", content = "value")]
+/// FieldIndex is an enum with variants [`ArrayIndex(usize)`],
+/// representing an index into an Array, or `[MapKey(String)`],
+/// representing a key into a Map.
+///
+/// ```
+/// #[allow(dead_code)]
+/// enum FieldIndex {
+///     ArrayIndex(u32),
+///     MapKey(String),
+/// }
+/// ```
+pub enum FieldIndex {
+    /// Index into an Array
+    ArrayIndex(u32),
+
+    /// Key into a Map
+    MapKey(String),
+
+    /// Map each element by applying a function or a comparison
+    MapEach,
+}
+
+impl<'i> Lex<'i> for FieldIndex {
+    fn lex(input: &'i str) -> LexResult<'i, Self> {
+        if let Ok(input) = expect(input, "*") {
+            return Ok((FieldIndex::MapEach, input));
+        }
+
+        // The token inside an [] can be either an integer index into an Array
+        // or a string key into a Map. The token is a key into a Map if it
+        // starts and ends with "\"", otherwise an integer index or an error.
+        let (rhs, rest) = match expect(input, "\"") {
+            Ok(_) => RhsValue::lex_with(input, Type::Bytes),
+            Err(_) => RhsValue::lex_with(input, Type::Int),
+        }?;
+
+        match rhs {
+            RhsValue::Int(i) => match u32::try_from(i) {
+                Ok(u) => Ok((FieldIndex::ArrayIndex(u), rest)),
+                Err(_) => Err((
+                    LexErrorKind::ExpectedLiteral("expected positive integer as index"),
+                    input,
+                )),
+            },
+            RhsValue::Bytes(b) => match String::from_utf8(b.to_vec()) {
+                Ok(s) => Ok((FieldIndex::MapKey(s), rest)),
+                Err(_) => Err((LexErrorKind::ExpectedLiteral("expected utf8 string"), input)),
+            },
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Fail)]
+#[fail(display = "cannot access index {:?} for type {:?}", _0, _1)]
+pub struct IndexAccessError {
+    pub index: FieldIndex,
+    pub actual: Type,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
-pub(crate) struct Field<'s> {
+/// A structure to represent a field inside a [`Scheme`](struct@Scheme).
+pub struct Field<'s> {
     scheme: &'s Scheme,
     index: usize,
 }
@@ -52,7 +123,7 @@ impl<'i, 's> LexWith<'i, &'s Scheme> for Field<'s> {
         let name = span(initial_input, input);
 
         let field = scheme
-            .get_field_index(name)
+            .get_field(name)
             .map_err(|err| (LexErrorKind::UnknownField(err), name))?;
 
         Ok((field, input))
@@ -60,14 +131,16 @@ impl<'i, 's> LexWith<'i, &'s Scheme> for Field<'s> {
 }
 
 impl<'s> Field<'s> {
+    /// Returns the field's name as recorded in the [`Scheme`](struct@Scheme).
     pub fn name(&self) -> &'s str {
         self.scheme.fields.get_index(self.index).unwrap().0
     }
 
-    pub fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.index
     }
 
+    /// Returns the [`Scheme`](struct@Scheme) to which this field belongs to.
     pub fn scheme(&self) -> &'s Scheme {
         self.scheme
     }
@@ -75,7 +148,7 @@ impl<'s> Field<'s> {
 
 impl<'s> GetType for Field<'s> {
     fn get_type(&self) -> Type {
-        *self.scheme.fields.get_index(self.index).unwrap().1
+        self.scheme.fields.get_index(self.index).unwrap().1.clone()
     }
 }
 
@@ -101,11 +174,14 @@ pub struct FieldRedefinitionError(String);
 #[fail(display = "attempt to redefine function {}", _0)]
 pub struct FunctionRedefinitionError(String);
 
+/// An error that occurs when trying to redefine a field or function.
 #[derive(Debug, PartialEq, Fail)]
 pub enum ItemRedefinitionError {
+    /// An error that occurs when previously defined field gets redefined.
     #[fail(display = "{}", _0)]
     Field(#[cause] FieldRedefinitionError),
 
+    /// An error that occurs when previously defined function gets redefined.
     #[fail(display = "{}", _0)]
     Function(#[cause] FunctionRedefinitionError),
 }
@@ -115,17 +191,33 @@ pub enum ItemRedefinitionError {
 /// For now, you can just print it in a debug or a human-readable fashion.
 #[derive(Debug, PartialEq)]
 pub struct ParseError<'i> {
+    /// The error that occurred when parsing the input
     kind: LexErrorKind,
+
+    /// The input that caused the parse error
     input: &'i str,
+
+    /// The line number on the input where the error occurred
     line_number: usize,
+
+    /// The start of the bad input
     span_start: usize,
+
+    /// The number of characters that span the bad input
     span_len: usize,
 }
 
 impl<'i> Error for ParseError<'i> {}
 
 impl<'i> ParseError<'i> {
-    pub(crate) fn new(mut input: &'i str, (kind, span): (LexErrorKind, &'i str)) -> Self {
+    /// Create a new ParseError for the input, LexErrorKind and span in the
+    /// input.
+    pub fn new(mut input: &'i str, (kind, span): (LexErrorKind, &'i str)) -> Self {
+        let input_range = input.as_ptr() as usize..=input.as_ptr() as usize + input.len();
+        assert!(
+            input_range.contains(&(span.as_ptr() as usize))
+                && input_range.contains(&(span.as_ptr() as usize + span.len()))
+        );
         let mut span_start = span.as_ptr() as usize - input.as_ptr() as usize;
 
         let (line_number, line_start) = input[..span_start]
@@ -188,12 +280,12 @@ impl<'i> Display for ParseError<'i> {
 /// This is necessary to provide typechecking for runtime values provided
 /// to the [execution context](::ExecutionContext) and also to aid parser
 /// in ambiguous contexts.
-#[derive(Default, Deserialize)]
+#[derive(Default, Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct Scheme {
     fields: IndexMap<String, Type, FnvBuildHasher>,
     #[serde(skip)]
-    functions: IndexMap<String, Function, FnvBuildHasher>,
+    functions: IndexMap<String, Box<dyn FunctionDefinition>, FnvBuildHasher>,
 }
 
 impl PartialEq for Scheme {
@@ -249,9 +341,23 @@ impl<'s> Scheme {
         Ok(scheme)
     }
 
-    pub(crate) fn get_field_index(&'s self, name: &str) -> Result<Field<'s>, UnknownFieldError> {
+    /// Returns the [`field`](struct@Field) with name [`name`]
+    pub fn get_field(&'s self, name: &str) -> Result<Field<'s>, UnknownFieldError> {
         match self.fields.get_full(name) {
             Some((index, ..)) => Ok(Field {
+                scheme: self,
+                index,
+            }),
+            None => Err(UnknownFieldError),
+        }
+    }
+
+    pub(crate) fn get_field_from_index(
+        &'s self,
+        index: usize,
+    ) -> Result<Field<'s>, UnknownFieldError> {
+        match self.fields.get_index(index) {
+            Some(_) => Ok(Field {
                 scheme: self,
                 index,
             }),
@@ -267,7 +373,7 @@ impl<'s> Scheme {
     pub fn add_function(
         &mut self,
         name: String,
-        function: Function,
+        function: impl FunctionDefinition + 'static,
     ) -> Result<(), ItemRedefinitionError> {
         if self.fields.contains_key(&name) {
             return Err(ItemRedefinitionError::Field(FieldRedefinitionError(name)));
@@ -277,24 +383,28 @@ impl<'s> Scheme {
                 FunctionRedefinitionError(entry.key().to_string()),
             )),
             Entry::Vacant(entry) => {
-                entry.insert(function);
+                entry.insert(Box::new(function));
                 Ok(())
             }
         }
     }
 
     /// Registers a list of functions
-    pub fn add_functions<I>(&mut self, functions: I) -> Result<(), ItemRedefinitionError>
-    where
-        I: IntoIterator<Item = (String, Function)>,
-    {
+    pub fn add_functions(
+        &mut self,
+        functions: impl IntoIterator<Item = (String, impl FunctionDefinition + 'static)>,
+    ) -> Result<(), ItemRedefinitionError> {
         for (name, func) in functions {
             self.add_function(name, func)?;
         }
         Ok(())
     }
 
-    pub(crate) fn get_function(&'s self, name: &str) -> Result<&'s Function, UnknownFunctionError> {
+    #[allow(clippy::borrowed_box)]
+    pub(crate) fn get_function(
+        &'s self,
+        name: &str,
+    ) -> Result<&'s Box<dyn FunctionDefinition>, UnknownFunctionError> {
         self.functions.get(name).ok_or(UnknownFunctionError)
     }
 
@@ -302,33 +412,46 @@ impl<'s> Scheme {
     pub fn parse<'i>(&'s self, input: &'i str) -> Result<FilterAst<'s>, ParseError<'i>> {
         complete(FilterAst::lex_with(input.trim(), self)).map_err(|err| ParseError::new(input, err))
     }
+
+    /// Iterates over all fields.
+    pub fn iter_fields(&self) -> impl ExactSizeIterator<Item = Field<'_>> {
+        (0..self.fields.len()).map(move |index| Field {
+            scheme: self,
+            index,
+        })
+    }
 }
 
 /// A convenience macro for constructing a [`Scheme`](struct@Scheme) with static
 /// contents.
 #[macro_export]
 macro_rules! Scheme {
-    ($($ns:ident $(. $field:ident)*: $ty:ident),* $(,)*) => {
+    ($($ns:ident $(. $field:ident)*: $ty:ident $(($subty:tt))?),* $(,)*) => {
         $crate::Scheme::try_from_iter(
             [$(
                 (
                     concat!(stringify!($ns) $(, ".", stringify!($field))*),
-                    $crate::Type::$ty
+                    Scheme!($ty $(($subty))?),
                 )
             ),*]
             .iter()
-            .map(|&(k, v)| (k.to_owned(), v)),
+            .map(|&(k, ref v)| (k.to_owned(), v.clone())),
         )
         // Treat duplciations in static schemes as a developer's mistake.
         .unwrap_or_else(|err| panic!("{}", err))
     };
+    ($ty:ident $(($subty:tt))?) => {crate::Type::$ty$((Box::new(Scheme!($subty))))?};
 }
 
 #[test]
 fn test_parse_error() {
+    use crate::types::TypeMismatchError;
     use indoc::indoc;
 
-    let scheme = &Scheme! { num: Int };
+    let scheme = &Scheme! {
+        num: Int,
+        arr: Array(Bool),
+    };
 
     {
         let err = scheme.parse("xyz").unwrap_err();
@@ -433,6 +556,509 @@ fn test_parse_error() {
             )
         );
     }
+
+    {
+        let err = scheme
+            .parse(indoc!(
+                r#"
+                arr and arr
+                "#
+            ))
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::TypeMismatch(TypeMismatchError {
+                    expected: Type::Bool.into(),
+                    actual: Type::Array(Box::new(Type::Bool)),
+                }),
+                input: "arr and arr",
+                line_number: 0,
+                span_start: 11,
+                span_len: 0,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:12):
+                arr and arr
+                           ^ expected value of type {Type(Bool)}, but got Array(Bool)
+                "#
+            )
+        );
+    }
+}
+
+#[test]
+fn test_parse_error_in_op() {
+    use cidr::NetworkParseError;
+    use indoc::indoc;
+    use std::{net::IpAddr, str::FromStr};
+
+    let scheme = &Scheme! {
+        num: Int,
+        bool: Bool,
+        str: Bytes,
+        ip: Ip,
+        str_arr: Array(Bytes),
+        str_map: Map(Bytes),
+    };
+
+    {
+        let err = scheme.parse("bool in {0}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::EOF,
+                input: "bool in {0}",
+                line_number: 0,
+                span_start: 4,
+                span_len: 7
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:5):
+                bool in {0}
+                    ^^^^^^^ unrecognised input
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("bool in {127.0.0.1}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::EOF,
+                input: "bool in {127.0.0.1}",
+                line_number: 0,
+                span_start: 4,
+                span_len: 15
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:5):
+                bool in {127.0.0.1}
+                    ^^^^^^^^^^^^^^^ unrecognised input
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("bool in {\"test\"}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::EOF,
+                input: "bool in {\"test\"}",
+                line_number: 0,
+                span_start: 4,
+                span_len: 12
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:5):
+                bool in {"test"}
+                    ^^^^^^^^^^^^ unrecognised input
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("num in {127.0.0.1}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ExpectedName("digit"),
+                input: "num in {127.0.0.1}",
+                line_number: 0,
+                span_start: 11,
+                span_len: 7
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:12):
+                num in {127.0.0.1}
+                           ^^^^^^^ expected digit
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("num in {\"test\"}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ExpectedName("digit"),
+                input: "num in {\"test\"}",
+                line_number: 0,
+                span_start: 8,
+                span_len: 7
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:9):
+                num in {"test"}
+                        ^^^^^^^ expected digit
+                "#
+            )
+        );
+    }
+    {
+        let err = scheme.parse("ip in {666}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ParseNetwork(
+                    IpAddr::from_str("666")
+                        .map_err(NetworkParseError::AddrParseError)
+                        .unwrap_err()
+                ),
+                input: "ip in {666}",
+                line_number: 0,
+                span_start: 7,
+                span_len: 3
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:8):
+                ip in {666}
+                       ^^^ couldn't parse address in network: invalid IP address syntax
+                "#
+            )
+        );
+    }
+    {
+        let err = scheme.parse("ip in {\"test\"}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ExpectedName("IP address character"),
+                input: "ip in {\"test\"}",
+                line_number: 0,
+                span_start: 7,
+                span_len: 7
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:8):
+                ip in {"test"}
+                       ^^^^^^^ expected IP address character
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("str in {0}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ParseInt {
+                    err: u8::from_str_radix("0}", 16).unwrap_err(),
+                    radix: 16,
+                },
+                input: "str in {0}",
+                line_number: 0,
+                span_start: 8,
+                span_len: 2
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:9):
+                str in {0}
+                        ^^ invalid digit found in string while parsing with radix 16
+                "#
+            )
+        );
+    }
+
+    {
+        let err = scheme.parse("str in {127.0.0.1}").unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                kind: LexErrorKind::ParseInt {
+                    err: u8::from_str_radix("7.}", 16).unwrap_err(),
+                    radix: 16,
+                },
+                input: "str in {127.0.0.1}",
+                line_number: 0,
+                span_start: 10,
+                span_len: 2
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            indoc!(
+                r#"
+                Filter parsing error (1:11):
+                str in {127.0.0.1}
+                          ^^ invalid digit found in string while parsing with radix 16
+                "#
+            )
+        );
+    }
+
+    for pattern in &["0", "127.0.0.1", "\"test\""] {
+        {
+            let filter = format!("str_arr in {{{}}}", pattern);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Array(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_map in {{{}}}", pattern);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Map(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn test_parse_error_ordering_op() {
+    let scheme = &Scheme! {
+        num: Int,
+        bool: Bool,
+        str: Bytes,
+        ip: Ip,
+        str_arr: Array(Bytes),
+        str_map: Map(Bytes),
+    };
+
+    for op in &["eq", "ne", "ge", "le", "gt", "lt"] {
+        {
+            let filter = format!("num {} 127.0.0.1", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::EOF,
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 10,
+                    span_len: 6
+                }
+            );
+        }
+
+        {
+            let filter = format!("num {} \"test\"", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::ExpectedName("digit"),
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 7,
+                    span_len: 6
+                }
+            );
+        }
+        {
+            let filter = format!("str {} 0", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::CountMismatch {
+                        name: "character",
+                        actual: 1,
+                        expected: 2,
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 7,
+                    span_len: 1
+                }
+            );
+        }
+
+        {
+            let filter = format!("str {} 256", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::EOF,
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 9,
+                    span_len: 1
+                }
+            );
+        }
+
+        {
+            let filter = format!("str {} 127.0.0.1", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::EOF,
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 9,
+                    span_len: 7
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_arr {} 0", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Array(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_arr {} \"test\"", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Array(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_arr {} 127.0.0.1", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Array(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_map {} 0", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Map(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_map {} \"test\"", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Map(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+
+        {
+            let filter = format!("str_map {} 127.0.0.1", op);
+            let err = scheme.parse(&filter).unwrap_err();
+            assert_eq!(
+                err,
+                ParseError {
+                    kind: LexErrorKind::UnsupportedOp {
+                        lhs_type: Type::Map(Box::new(Type::Bytes))
+                    },
+                    input: &filter,
+                    line_number: 0,
+                    span_start: 8,
+                    span_len: 2
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -441,23 +1067,24 @@ fn test_field() {
         x: Bytes,
         x.y.z0: Int,
         is_TCP: Bool,
+        map: Map(Bytes)
     };
 
     assert_ok!(
         Field::lex_with("x;", scheme),
-        scheme.get_field_index("x").unwrap(),
+        scheme.get_field("x").unwrap(),
         ";"
     );
 
     assert_ok!(
         Field::lex_with("x.y.z0-", scheme),
-        scheme.get_field_index("x.y.z0").unwrap(),
+        scheme.get_field("x.y.z0").unwrap(),
         "-"
     );
 
     assert_ok!(
         Field::lex_with("is_TCP", scheme),
-        scheme.get_field_index("is_TCP").unwrap(),
+        scheme.get_field("is_TCP").unwrap(),
         ""
     );
 
@@ -494,4 +1121,42 @@ fn test_field_type_override() {
         scheme.add_field("foo".into(), Type::Bytes).unwrap_err(),
         ItemRedefinitionError::Field(FieldRedefinitionError("foo".into()))
     )
+}
+
+#[test]
+fn test_field_lex_indexes() {
+    assert_ok!(FieldIndex::lex("0"), FieldIndex::ArrayIndex(0));
+    assert_err!(
+        FieldIndex::lex("-1"),
+        LexErrorKind::ExpectedLiteral("expected positive integer as index"),
+        "-1"
+    );
+
+    assert_ok!(
+        FieldIndex::lex("\"cookies\""),
+        FieldIndex::MapKey("cookies".into())
+    );
+}
+
+#[test]
+fn test_scheme_iter_fields() {
+    let scheme = &Scheme! {
+        x: Bytes,
+        x.y.z0: Int,
+        is_TCP: Bool,
+        map: Map(Bytes)
+    };
+
+    let mut fields = scheme.iter_fields().collect::<Vec<_>>();
+    fields.sort_by(|f1, f2| f1.name().partial_cmp(f2.name()).unwrap());
+
+    assert_eq!(
+        fields,
+        vec![
+            scheme.get_field("is_TCP").unwrap(),
+            scheme.get_field("map").unwrap(),
+            scheme.get_field("x").unwrap(),
+            scheme.get_field("x.y.z0").unwrap(),
+        ]
+    );
 }

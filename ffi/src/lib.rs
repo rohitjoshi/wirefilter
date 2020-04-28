@@ -1,24 +1,110 @@
+pub mod panic;
 pub mod transfer_types;
 
+use crate::panic::catch_panic;
 use crate::transfer_types::{
     ExternallyAllocatedByteArr, ExternallyAllocatedStr, RustAllocatedString, RustBox,
     StaticRustAllocatedString,
 };
 use fnv::FnvHasher;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use std::{
+    convert::TryFrom,
     hash::Hasher,
     io::{self, Write},
     net::IpAddr,
 };
-use wirefilter::{ExecutionContext, Filter, FilterAst, ParseError, Scheme, Type};
+use wirefilter::{
+    Array, ExecutionContext, FieldIndex, Filter, FilterAst, LhsValue, Map, ParseError, Scheme, Type,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[derive(Debug, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
-pub enum ParsingResult<'s> {
-    Err(RustAllocatedString),
-    Ok(RustBox<FilterAst<'s>>),
+pub enum CTypeTag {
+    Ip,
+    Bytes,
+    Int,
+    Bool,
+    Array,
+    Map,
 }
+
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct CType {
+    tag: u8,
+    data: Option<Box<Type>>,
+}
+
+impl From<CType> for Type {
+    fn from(ty: CType) -> Self {
+        match CTypeTag::try_from(ty.tag).unwrap() {
+            CTypeTag::Ip => Type::Ip,
+            CTypeTag::Bytes => Type::Bytes,
+            CTypeTag::Int => Type::Int,
+            CTypeTag::Bool => Type::Bool,
+            CTypeTag::Array => Type::Array(ty.data.unwrap()),
+            CTypeTag::Map => Type::Map(ty.data.unwrap()),
+        }
+    }
+}
+
+impl From<Type> for CType {
+    fn from(ty: Type) -> Self {
+        match ty {
+            Type::Ip => CType {
+                tag: CTypeTag::Ip.into(),
+                data: None,
+            },
+            Type::Bytes => CType {
+                tag: CTypeTag::Bytes.into(),
+                data: None,
+            },
+            Type::Int => CType {
+                tag: CTypeTag::Int.into(),
+                data: None,
+            },
+            Type::Bool => CType {
+                tag: CTypeTag::Bool.into(),
+                data: None,
+            },
+            Type::Array(arr) => CType {
+                tag: CTypeTag::Array.into(),
+                data: Some(arr),
+            },
+            Type::Map(map) => CType {
+                tag: CTypeTag::Map.into(),
+                data: Some(map),
+            },
+        }
+    }
+}
+
+#[repr(u8)]
+pub enum CResult<T> {
+    Err(RustAllocatedString),
+    Ok(T),
+}
+
+impl<T> CResult<T> {
+    pub fn unwrap(self) -> T {
+        match self {
+            CResult::Err(err) => panic!("{}", &err as &str),
+            CResult::Ok(ok) => ok,
+        }
+    }
+
+    pub fn into_result(self) -> Result<T, RustAllocatedString> {
+        match self {
+            CResult::Ok(ok) => Ok(ok),
+            CResult::Err(err) => Err(err),
+        }
+    }
+}
+
+pub type ParsingResult<'s> = CResult<RustBox<FilterAst<'s>>>;
 
 impl<'s> From<FilterAst<'s>> for ParsingResult<'s> {
     fn from(filter_ast: FilterAst<'s>) -> Self {
@@ -32,14 +118,15 @@ impl<'s, 'a> From<ParseError<'a>> for ParsingResult<'s> {
     }
 }
 
-impl<'s> ParsingResult<'s> {
-    pub fn unwrap(self) -> RustBox<FilterAst<'s>> {
-        match self {
-            ParsingResult::Err(err) => panic!("{}", &err as &str),
-            ParsingResult::Ok(filter) => filter,
-        }
-    }
-}
+type UsingResult = CResult<bool>;
+
+type CompilingResult<'s> = CResult<RustBox<Filter<'s>>>;
+
+type MatchingResult = CResult<bool>;
+
+type SerializingResult = CResult<RustAllocatedString>;
+
+type HashingResult = CResult<u64>;
 
 #[no_mangle]
 pub extern "C" fn wirefilter_create_scheme() -> RustBox<Scheme> {
@@ -52,12 +139,30 @@ pub extern "C" fn wirefilter_free_scheme(scheme: RustBox<Scheme>) {
 }
 
 #[no_mangle]
+pub extern "C" fn wirefilter_create_map_type(ty: CType) -> CType {
+    CType {
+        tag: CTypeTag::Map.into(),
+        data: Some(Box::new(Type::from(ty))),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_create_array_type(ty: CType) -> CType {
+    CType {
+        tag: CTypeTag::Array.into(),
+        data: Some(Box::new(Type::from(ty))),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn wirefilter_add_type_field_to_scheme(
     scheme: &mut Scheme,
     name: ExternallyAllocatedStr<'_>,
-    ty: Type,
-) {
-    scheme.add_field(name.into_ref().to_owned(), ty).unwrap();
+    ty: CType,
+) -> bool {
+    scheme
+        .add_field(name.into_ref().to_owned(), ty.into())
+        .is_ok()
 }
 
 #[no_mangle]
@@ -75,10 +180,17 @@ pub extern "C" fn wirefilter_parse_filter<'s, 'i>(
     scheme: &'s Scheme,
     input: ExternallyAllocatedStr<'i>,
 ) -> ParsingResult<'s> {
-    match scheme.parse(input.into_ref()) {
-        Ok(filter) => ParsingResult::from(filter),
-        Err(err) => ParsingResult::from(err),
-    }
+    catch_panic(std::panic::AssertUnwindSafe(|| {
+        match scheme.parse(input.into_ref()) {
+            Ok(filter) => ParsingResult::from(filter),
+            Err(err) => ParsingResult::from(err),
+        }
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_filter_ast(ast: RustBox<FilterAst<'_>>) {
+    drop(ast);
 }
 
 #[no_mangle]
@@ -106,29 +218,61 @@ impl<H: Hasher> Write for HasherWrite<H> {
     }
 }
 
-fn unwrap_json_result<T>(filter_ast: &FilterAst<'_>, result: serde_json::Result<T>) -> T {
-    // Filter serialisation must never fail.
-    result.unwrap_or_else(|err| panic!("{} while serializing filter {:#?}", err, filter_ast))
-}
-
 #[no_mangle]
-pub extern "C" fn wirefilter_get_filter_hash(filter_ast: &FilterAst<'_>) -> u64 {
+pub extern "C" fn wirefilter_get_filter_hash(filter_ast: &FilterAst<'_>) -> HashingResult {
     let mut hasher = FnvHasher::default();
     // Serialize JSON to our Write-compatible wrapper around FnvHasher,
     // effectively calculating a hash for our filter in a streaming fashion
     // that is as stable as the JSON representation itself
     // (instead of relying on #[derive(Hash)] which would be tied to impl details).
-    let result = serde_json::to_writer(HasherWrite(&mut hasher), filter_ast);
-    unwrap_json_result(filter_ast, result);
-    hasher.finish()
+    match serde_json::to_writer(HasherWrite(&mut hasher), filter_ast) {
+        Ok(_) => HashingResult::Ok(hasher.finish()),
+        Err(err) => {
+            HashingResult::Err(format!("{} while serializing filter {:#?}", err, filter_ast).into())
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_hashing_result(r: HashingResult) {
+    drop(r);
 }
 
 #[no_mangle]
 pub extern "C" fn wirefilter_serialize_filter_to_json(
     filter_ast: &FilterAst<'_>,
-) -> RustAllocatedString {
-    let result = serde_json::to_string(filter_ast);
-    unwrap_json_result(filter_ast, result).into()
+) -> SerializingResult {
+    match serde_json::to_string(filter_ast) {
+        Ok(ok) => SerializingResult::Ok(ok.into()),
+        Err(err) => SerializingResult::Err(
+            format!("{} while serializing filter {:#?}", err, filter_ast).into(),
+        ),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_serialize_scheme_to_json(scheme: &Scheme) -> SerializingResult {
+    match serde_json::to_string(scheme) {
+        Ok(ok) => SerializingResult::Ok(ok.into()),
+        Err(err) => {
+            SerializingResult::Err(format!("{} while serializing scheme {:#?}", err, scheme).into())
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_serialize_type_to_json(ty: &CType) -> SerializingResult {
+    match serde_json::to_string(&Type::from(ty.clone())) {
+        Ok(ok) => SerializingResult::Ok(ok.into()),
+        Err(err) => {
+            SerializingResult::Err(format!("{} while serializing type {:#?}", err, ty).into())
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_serializing_result(r: SerializingResult) {
+    drop(r);
 }
 
 #[no_mangle]
@@ -136,6 +280,22 @@ pub extern "C" fn wirefilter_create_execution_context<'e, 's: 'e>(
     scheme: &'s Scheme,
 ) -> RustBox<ExecutionContext<'e>> {
     ExecutionContext::new(scheme).into()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_serialize_execution_context_to_json<'a>(
+    exec_context: &mut ExecutionContext<'a>,
+) -> SerializingResult {
+    match serde_json::to_string(exec_context) {
+        Ok(ok) => SerializingResult::Ok(ok.into()),
+        Err(err) => SerializingResult::Err(
+            format!(
+                "{} while serializing execution context {:#?}",
+                err, exec_context
+            )
+            .into(),
+        ),
+    }
 }
 
 #[no_mangle]
@@ -148,10 +308,12 @@ pub extern "C" fn wirefilter_add_int_value_to_execution_context<'a>(
     exec_context: &mut ExecutionContext<'a>,
     name: ExternallyAllocatedStr<'_>,
     value: i32,
-) {
-    exec_context
-        .set_field_value(name.into_ref(), value)
-        .unwrap();
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    exec_context.set_field_value(field, value).is_ok()
 }
 
 #[no_mangle]
@@ -159,11 +321,13 @@ pub extern "C" fn wirefilter_add_bytes_value_to_execution_context<'a>(
     exec_context: &mut ExecutionContext<'a>,
     name: ExternallyAllocatedStr<'_>,
     value: ExternallyAllocatedByteArr<'a>,
-) {
+) -> bool {
     let slice: &[u8] = value.into_ref();
-    exec_context
-        .set_field_value(name.into_ref(), slice)
-        .unwrap();
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    exec_context.set_field_value(field, slice).is_ok()
 }
 
 #[no_mangle]
@@ -171,10 +335,14 @@ pub extern "C" fn wirefilter_add_ipv6_value_to_execution_context(
     exec_context: &mut ExecutionContext<'_>,
     name: ExternallyAllocatedStr<'_>,
     value: &[u8; 16],
-) {
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
     exec_context
-        .set_field_value(name.into_ref(), IpAddr::from(*value))
-        .unwrap();
+        .set_field_value(field, IpAddr::from(*value))
+        .is_ok()
 }
 
 #[no_mangle]
@@ -182,10 +350,14 @@ pub extern "C" fn wirefilter_add_ipv4_value_to_execution_context(
     exec_context: &mut ExecutionContext<'_>,
     name: ExternallyAllocatedStr<'_>,
     value: &[u8; 4],
-) {
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
     exec_context
-        .set_field_value(name.into_ref(), IpAddr::from(*value))
-        .unwrap();
+        .set_field_value(field, IpAddr::from(*value))
+        .is_ok()
 }
 
 #[no_mangle]
@@ -193,26 +365,248 @@ pub extern "C" fn wirefilter_add_bool_value_to_execution_context(
     exec_context: &mut ExecutionContext<'_>,
     name: ExternallyAllocatedStr<'_>,
     value: bool,
-) {
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    exec_context.set_field_value(field, value).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_map_value_to_execution_context<'a>(
+    exec_context: &mut ExecutionContext<'a>,
+    name: ExternallyAllocatedStr<'_>,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
     exec_context
-        .set_field_value(name.into_ref(), value)
-        .unwrap();
+        .set_field_value(field, *value.into_real_box())
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_array_value_to_execution_context<'a>(
+    exec_context: &mut ExecutionContext<'a>,
+    name: ExternallyAllocatedStr<'_>,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    let field = match exec_context.scheme().get_field(name.into_ref()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    exec_context
+        .set_field_value(field, *value.into_real_box())
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_create_map<'a>(ty: CType) -> RustBox<LhsValue<'a>> {
+    let map = Box::new(LhsValue::Map(Map::new(ty.into())));
+    map.into()
+}
+
+// TODO: store a Box<[u8] inside FieldIndex::MapKey instead of String
+// and call map.set(FieldIndex::MapKey(key), value.into()) directly
+macro_rules! map_insert {
+    ($map:ident, $name:ident, $value:ident) => {
+        match $map {
+            LhsValue::Map(map) => map.insert($name.into_ref(), $value.into()).is_ok(),
+            _ => unreachable!(),
+        }
+    };
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_int_value_to_map(
+    map: &mut LhsValue<'_>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: i32,
+) -> bool {
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_bytes_value_to_map<'a>(
+    map: &mut LhsValue<'a>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: ExternallyAllocatedByteArr<'a>,
+) -> bool {
+    let slice: &[u8] = value.into_ref();
+    map_insert!(map, name, slice)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_ipv6_value_to_map(
+    map: &mut LhsValue<'_>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: &[u8; 16],
+) -> bool {
+    let value = IpAddr::from(*value);
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_ipv4_value_to_map(
+    map: &mut LhsValue<'_>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: &[u8; 4],
+) -> bool {
+    let value = IpAddr::from(*value);
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_bool_value_to_map(
+    map: &mut LhsValue<'_>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: bool,
+) -> bool {
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_map_value_to_map<'a>(
+    map: &mut LhsValue<'a>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    let value = *value.into_real_box();
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_array_value_to_map<'a>(
+    map: &mut LhsValue<'a>,
+    name: ExternallyAllocatedByteArr<'_>,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    let value = *value.into_real_box();
+    map_insert!(map, name, value)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_map(map: RustBox<LhsValue<'_>>) {
+    drop(map)
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_create_array<'a>(ty: CType) -> RustBox<LhsValue<'a>> {
+    let arr = Box::new(LhsValue::Array(Array::new(ty.into())));
+    arr.into()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_int_value_to_array(
+    array: &mut LhsValue<'_>,
+    index: u32,
+    value: i32,
+) -> bool {
+    array.set(FieldIndex::ArrayIndex(index), value).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_bytes_value_to_array<'a>(
+    array: &mut LhsValue<'a>,
+    index: u32,
+    value: ExternallyAllocatedByteArr<'a>,
+) -> bool {
+    let slice: &[u8] = value.into_ref();
+    array.set(FieldIndex::ArrayIndex(index), slice).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_ipv6_value_to_array(
+    array: &mut LhsValue<'_>,
+    index: u32,
+    value: &[u8; 16],
+) -> bool {
+    array
+        .set(FieldIndex::ArrayIndex(index), IpAddr::from(*value))
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_ipv4_value_to_array(
+    array: &mut LhsValue<'_>,
+    index: u32,
+    value: &[u8; 4],
+) -> bool {
+    array
+        .set(FieldIndex::ArrayIndex(index), IpAddr::from(*value))
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_bool_value_to_array(
+    array: &mut LhsValue<'_>,
+    index: u32,
+    value: bool,
+) -> bool {
+    array.set(FieldIndex::ArrayIndex(index), value).is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_map_value_to_array<'a>(
+    array: &mut LhsValue<'a>,
+    index: u32,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    array
+        .set(FieldIndex::ArrayIndex(index), *value.into_real_box())
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_add_array_value_to_array<'a>(
+    array: &mut LhsValue<'a>,
+    index: u32,
+    value: RustBox<LhsValue<'a>>,
+) -> bool {
+    array
+        .set(FieldIndex::ArrayIndex(index), *value.into_real_box())
+        .is_ok()
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_array(array: RustBox<LhsValue<'_>>) {
+    drop(array)
 }
 
 #[no_mangle]
 pub extern "C" fn wirefilter_compile_filter<'s>(
     filter_ast: RustBox<FilterAst<'s>>,
-) -> RustBox<Filter<'s>> {
-    let filter_ast = filter_ast.into_real_box();
-    filter_ast.compile().into()
+) -> CompilingResult {
+    catch_panic(std::panic::AssertUnwindSafe(|| {
+        let filter_ast = filter_ast.into_real_box();
+        CompilingResult::Ok(filter_ast.compile().into())
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_compiling_result(r: CompilingResult) {
+    drop(r);
 }
 
 #[no_mangle]
 pub extern "C" fn wirefilter_match<'s>(
     filter: &Filter<'s>,
     exec_context: &ExecutionContext<'s>,
-) -> bool {
-    filter.execute(exec_context).unwrap()
+) -> MatchingResult {
+    catch_panic(std::panic::AssertUnwindSafe(|| {
+        match filter.execute(exec_context) {
+            Ok(ok) => MatchingResult::Ok(ok),
+            Err(err) => MatchingResult::Err(RustAllocatedString::from(err.to_string())),
+        }
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_matching_result(r: MatchingResult) {
+    drop(r);
 }
 
 #[no_mangle]
@@ -224,8 +618,18 @@ pub extern "C" fn wirefilter_free_compiled_filter(filter: RustBox<Filter<'_>>) {
 pub extern "C" fn wirefilter_filter_uses(
     filter_ast: &FilterAst<'_>,
     field_name: ExternallyAllocatedStr<'_>,
-) -> bool {
-    filter_ast.uses(field_name.into_ref()).unwrap()
+) -> UsingResult {
+    catch_panic(std::panic::AssertUnwindSafe(|| {
+        match filter_ast.uses(field_name.into_ref()) {
+            Ok(ok) => UsingResult::Ok(ok),
+            Err(err) => UsingResult::Err(RustAllocatedString::from(err.to_string())),
+        }
+    }))
+}
+
+#[no_mangle]
+pub extern "C" fn wirefilter_free_using_result(r: UsingResult) {
+    drop(r);
 }
 
 #[no_mangle]
@@ -244,34 +648,44 @@ mod ffi_test {
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("ip1"),
-            Type::Ip,
+            Type::Ip.into(),
         );
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("ip2"),
-            Type::Ip,
+            Type::Ip.into(),
         );
 
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("str1"),
-            Type::Bytes,
+            Type::Bytes.into(),
         );
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("str2"),
-            Type::Bytes,
+            Type::Bytes.into(),
         );
 
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("num1"),
-            Type::Int,
+            Type::Int.into(),
         );
         wirefilter_add_type_field_to_scheme(
             &mut scheme,
             ExternallyAllocatedStr::from("num2"),
-            Type::Int,
+            Type::Int.into(),
+        );
+        wirefilter_add_type_field_to_scheme(
+            &mut scheme,
+            ExternallyAllocatedStr::from("map1"),
+            wirefilter_create_map_type(Type::Int.into()),
+        );
+        wirefilter_add_type_field_to_scheme(
+            &mut scheme,
+            ExternallyAllocatedStr::from("map2"),
+            wirefilter_create_map_type(Type::Bytes.into()),
         );
 
         scheme
@@ -279,6 +693,9 @@ mod ffi_test {
 
     fn create_execution_context<'e, 's: 'e>(scheme: &'s Scheme) -> RustBox<ExecutionContext<'e>> {
         let mut exec_context = wirefilter_create_execution_context(scheme);
+        let invalid_key = &b"\xc3\x28"[..];
+
+        assert!(std::str::from_utf8(invalid_key).is_err());
 
         wirefilter_add_ipv4_value_to_execution_context(
             &mut exec_context,
@@ -316,6 +733,42 @@ mod ffi_test {
             1337,
         );
 
+        let mut map1 = wirefilter_create_map(Type::Int.into());
+
+        wirefilter_add_int_value_to_map(&mut map1, ExternallyAllocatedByteArr::from("key"), 42);
+
+        wirefilter_add_int_value_to_map(
+            &mut map1,
+            ExternallyAllocatedByteArr::from(invalid_key),
+            42,
+        );
+
+        wirefilter_add_map_value_to_execution_context(
+            &mut exec_context,
+            ExternallyAllocatedStr::from("map1"),
+            map1,
+        );
+
+        let mut map2 = wirefilter_create_map(Type::Bytes.into());
+
+        wirefilter_add_bytes_value_to_map(
+            &mut map2,
+            ExternallyAllocatedByteArr::from("key"),
+            ExternallyAllocatedByteArr::from("value"),
+        );
+
+        wirefilter_add_bytes_value_to_map(
+            &mut map2,
+            ExternallyAllocatedByteArr::from(invalid_key),
+            ExternallyAllocatedByteArr::from("value"),
+        );
+
+        wirefilter_add_map_value_to_execution_context(
+            &mut exec_context,
+            ExternallyAllocatedStr::from("map2"),
+            map2,
+        );
+
         exec_context
     }
 
@@ -329,13 +782,13 @@ mod ffi_test {
         exec_context: &ExecutionContext<'_>,
     ) -> bool {
         let filter = parse_filter(scheme, input).unwrap();
-        let filter = wirefilter_compile_filter(filter);
+        let filter = wirefilter_compile_filter(filter).unwrap();
 
         let result = wirefilter_match(&filter, exec_context);
 
         wirefilter_free_compiled_filter(filter);
 
-        result
+        result.unwrap()
     }
 
     #[test]
@@ -385,7 +838,7 @@ mod ffi_test {
         {
             let filter = parse_filter(&scheme, r#"num1 > 3 && str2 == "abc""#).unwrap();
 
-            let json = wirefilter_serialize_filter_to_json(&filter);
+            let json = wirefilter_serialize_filter_to_json(&filter).unwrap();
 
             assert_eq!(
                 &json as &str,
@@ -401,6 +854,19 @@ mod ffi_test {
     }
 
     #[test]
+    fn scheme_serialize() {
+        let scheme = create_scheme();
+        let json = wirefilter_serialize_scheme_to_json(&scheme).unwrap();
+
+        let expected: String = serde_json::to_string(&*scheme).unwrap();
+        assert_eq!(&json as &str, expected);
+
+        wirefilter_free_string(json);
+
+        wirefilter_free_scheme(scheme);
+    }
+
+    #[test]
     fn filter_matching() {
         let scheme = create_scheme();
 
@@ -408,13 +874,13 @@ mod ffi_test {
             let exec_context = create_execution_context(&scheme);
 
             assert!(match_filter(
-                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+""#,
+                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+" && map2["key"] == "value""#,
                 &scheme,
                 &exec_context
             ));
 
             assert!(match_filter(
-                r#"ip2 == 0:0:0:0:0:ffff:c0a8:1 && (str1 == "Hey" || str2 == "ya")"#,
+                r#"ip2 == 0:0:0:0:0:ffff:c0a8:1 && (str1 == "Hey" || str2 == "ya") && (map1["key"] == 42 || map2["key2"] == "value")"#,
                 &scheme,
                 &exec_context
             ));
@@ -438,21 +904,21 @@ mod ffi_test {
         {
             let filter1 = parse_filter(
                 &scheme,
-                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+""#,
+                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+" && map1["key"] == 42"#,
             )
             .unwrap();
 
             let filter2 = parse_filter(
                 &scheme,
-                r#"num1 >     41 && num2 == 1337 &&    ip1 != 192.168.0.1 and str2 ~ "yo\d+""#,
+                r#"num1 >     41 && num2 == 1337 &&    ip1 != 192.168.0.1 and str2 ~ "yo\d+"    && map1["key"] == 42   "#,
             )
             .unwrap();
 
             let filter3 = parse_filter(&scheme, r#"num1 > 41 && num2 == 1337"#).unwrap();
 
-            let hash1 = wirefilter_get_filter_hash(&filter1);
-            let hash2 = wirefilter_get_filter_hash(&filter2);
-            let hash3 = wirefilter_get_filter_hash(&filter3);
+            let hash1 = wirefilter_get_filter_hash(&filter1).unwrap();
+            let hash2 = wirefilter_get_filter_hash(&filter2).unwrap();
+            let hash3 = wirefilter_get_filter_hash(&filter3).unwrap();
 
             assert_eq!(hash1, hash2);
             assert_ne!(hash2, hash3);
@@ -480,34 +946,27 @@ mod ffi_test {
         {
             let filter = parse_filter(
                 &scheme,
-                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+""#,
+                r#"num1 > 41 && num2 == 1337 && ip1 != 192.168.0.1 && str2 ~ "yo\d+" && map1["key"] == 42"#,
             )
             .unwrap();
 
-            assert!(wirefilter_filter_uses(
-                &filter,
-                ExternallyAllocatedStr::from("num1")
-            ));
+            assert!(wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("num1")).unwrap());
 
-            assert!(wirefilter_filter_uses(
-                &filter,
-                ExternallyAllocatedStr::from("ip1")
-            ));
+            assert!(wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("ip1")).unwrap());
 
-            assert!(wirefilter_filter_uses(
-                &filter,
-                ExternallyAllocatedStr::from("str2")
-            ));
+            assert!(wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("str2")).unwrap());
 
-            assert!(!wirefilter_filter_uses(
-                &filter,
-                ExternallyAllocatedStr::from("str1")
-            ));
+            assert!(
+                !wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("str1")).unwrap()
+            );
 
-            assert!(!wirefilter_filter_uses(
-                &filter,
-                ExternallyAllocatedStr::from("ip2")
-            ));
+            assert!(!wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("ip2")).unwrap());
+
+            assert!(wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("map1")).unwrap());
+
+            assert!(
+                !wirefilter_filter_uses(&filter, ExternallyAllocatedStr::from("map2")).unwrap()
+            );
 
             wirefilter_free_parsed_filter(filter);
         }

@@ -1,13 +1,15 @@
-mod combined_expr;
 mod field_expr;
 mod function_expr;
+mod index_expr;
+mod logical_expr;
 mod simple_expr;
 
-use self::combined_expr::CombinedExpr;
+use self::logical_expr::LogicalExpr;
 use crate::{
     filter::{CompiledExpr, Filter},
-    lex::{LexResult, LexWith},
+    lex::{LexErrorKind, LexResult, LexWith},
     scheme::{Field, Scheme, UnknownFieldError},
+    types::{GetType, Type, TypeMismatchError},
 };
 use serde::Serialize;
 use std::fmt::{self, Debug};
@@ -28,7 +30,7 @@ pub struct FilterAst<'s> {
     #[serde(skip)]
     scheme: &'s Scheme,
 
-    op: CombinedExpr<'s>,
+    op: LogicalExpr<'s>,
 }
 
 impl<'s> Debug for FilterAst<'s> {
@@ -39,8 +41,28 @@ impl<'s> Debug for FilterAst<'s> {
 
 impl<'i, 's> LexWith<'i, &'s Scheme> for FilterAst<'s> {
     fn lex_with(input: &'i str, scheme: &'s Scheme) -> LexResult<'i, Self> {
-        let (op, input) = CombinedExpr::lex_with(input, scheme)?;
-        Ok((FilterAst { scheme, op }, input))
+        let (op, input) = LogicalExpr::lex_with(input, scheme)?;
+        // LogicalExpr::lex_with can return an AST where the root is an
+        // LogicalExpr::Combining of type [`Array(Bool)`].
+        //
+        // It must do this because we need to be able to use
+        // LogicalExpr::Combining of type [`Array(Bool)`]
+        // as arguments to functions, however it should not be valid as a
+        // filter expression itself.
+        //
+        // Here we enforce the constraint that the root of the AST, a
+        // LogicalExpr, must evaluate to type [`Bool`].
+        let ty = op.get_type();
+        match ty {
+            Type::Bool => Ok((FilterAst { scheme, op }, input)),
+            _ => Err((
+                LexErrorKind::TypeMismatch(TypeMismatchError {
+                    expected: Type::Bool.into(),
+                    actual: ty,
+                }),
+                input,
+            )),
+        }
     }
 }
 
@@ -50,12 +72,15 @@ impl<'s> FilterAst<'s> {
     /// This is useful to lazily initialise expensive fields only if necessary.
     pub fn uses(&self, field_name: &str) -> Result<bool, UnknownFieldError> {
         self.scheme
-            .get_field_index(field_name)
+            .get_field(field_name)
             .map(|field| self.op.uses(field))
     }
 
     /// Compiles a [`FilterAst`] into a [`Filter`].
     pub fn compile(self) -> Filter<'s> {
-        Filter::new(self.op.compile(), self.scheme)
+        match self.op.compile() {
+            CompiledExpr::One(one) => Filter::new(one, self.scheme),
+            CompiledExpr::Vec(_) => unreachable!(),
+        }
     }
 }

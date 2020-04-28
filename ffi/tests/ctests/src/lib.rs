@@ -29,16 +29,25 @@ macro_rules! ffi_ctest {
 
 mod ffi_ctest {
     ffi_ctest!(
+        create_array_type,
+        create_map_type,
         create_scheme,
         add_fields_to_scheme,
+        add_malloced_type_field_to_scheme,
         parse_good_filter,
         parse_bad_filter,
         filter_uses_field,
         filter_hash,
         filter_serialize,
+        scheme_serialize,
+        type_serialize,
         compile_filter,
         create_execution_context,
         add_values_to_execution_context,
+        add_values_to_execution_context_errors,
+        execution_context_serialize,
         match_filter,
+        match_map,
+        match_array,
     );
 }
