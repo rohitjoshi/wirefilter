@@ -10,6 +10,7 @@ use crate::{
 // under the hood propagates field values to its leafs by recursively calling
 // their `execute` methods and aggregating results into a single boolean value
 // as recursion unwinds.
+
 pub(crate) struct CompiledOneExpr<'s>(
     Box<dyn for<'e> Fn(&'e ExecutionContext<'e>) -> bool + Sync + Send + 's>,
 );
@@ -52,6 +53,7 @@ pub(crate) enum CompiledExpr<'s> {
     One(CompiledOneExpr<'s>),
     Vec(CompiledVecExpr<'s>),
 }
+
 
 impl<'s> CompiledExpr<'s> {
     #[cfg(test)]
@@ -99,6 +101,7 @@ impl<'s> CompiledValueExpr<'s> {
 
     /// Executes a filter against a provided context with values.
     pub fn execute<'e>(&self, ctx: &'e ExecutionContext<'e>) -> CompiledValueResult<'e> {
+
         self.0(ctx)
     }
 }
@@ -141,7 +144,7 @@ impl<'s> Filter<'s> {
 
 #[cfg(test)]
 mod tests {
-    use super::SchemeMismatchError;
+    use super::{Filter, SchemeMismatchError};
     use crate::execution_context::ExecutionContext;
 
     #[test]
@@ -152,5 +155,14 @@ mod tests {
         let ctx = ExecutionContext::new(&scheme2);
 
         assert_eq!(filter.execute(&ctx), Err(SchemeMismatchError));
+    }
+
+    #[test]
+    fn ensure_send_and_sync() {
+        fn is_send<T: Send>() {}
+        fn is_sync<T: Sync>() {}
+
+        is_send::<Filter>();
+        is_sync::<Filter>();
     }
 }

@@ -141,6 +141,7 @@ impl<'s> LhsFieldExpr<'s> {
     }
 
     pub fn compile(self) -> CompiledValueExpr<'s> {
+
         match self {
             LhsFieldExpr::Field(f) => {
                 CompiledValueExpr::new(move |ctx| ctx.get_field_value_unchecked(f).as_ref().into())
@@ -302,10 +303,10 @@ impl<'s> Expr<'s> for ComparisonExpr<'s> {
             ComparisonOpExpr::Int {
                 op: IntOp::BitwiseAnd,
                 rhs,
+
             } => lhs.compile_with(false, &[], move |x| cast_value!(x, Int) & rhs != 0),
             ComparisonOpExpr::Contains(bytes) => {
                 let searcher = HeapSearcher::from(bytes);
-
                 lhs.compile_with(false, &[], move |x| {
                     searcher.search_in(cast_value!(x, Bytes)).is_some()
                 })
