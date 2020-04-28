@@ -2,7 +2,7 @@ use memmem::{Searcher, TwoWaySearcher};
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::NonNull;
-
+use std::mem::ManuallyDrop;
 /// A version of [`TwoWaySearcher`] that owns the needle data.
 pub struct HeapSearcher {
 
@@ -29,22 +29,20 @@ impl<T: Into<Box<[u8]>>> From<T> for HeapSearcher {
         }
     }
 }
-
-
+impl Drop for HeapSearcher {
+    fn drop(&mut self) {
         unsafe {
-
             // Explicitly drop `searcher` first in case it needs `bytes` to be alive.
             ManuallyDrop::drop(&mut self.searcher);
             // Then, drop `bytes`.
             ManuallyDrop::drop(&mut self.bytes);
         }
 
-        heap_searcher
     }
 }
 
 impl Searcher for HeapSearcher {
     fn search_in(&self, haystack: &[u8]) -> Option<usize> {
-        self.inner.as_ref().unwrap().search_in(haystack)
+        self.searcher.search_in(haystack)
     }
 }
